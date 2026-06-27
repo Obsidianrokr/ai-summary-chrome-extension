@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "AI Page & YouTube Summary",
+  "description": "Summarize YouTube videos and web articles with DeepSeek. Uses transcript extraction and Mozilla Readability.",
+  "version": "0.3.0",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "https://api.deepseek.com/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AI Page & YouTube Summary",
+    "default_popup": "popup.html"
+  }
+}

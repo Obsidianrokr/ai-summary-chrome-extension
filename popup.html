@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI Page & YouTube Summary</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <div>
+          <h1>AI Page & YouTube Summary</h1>
+          <p id="subtitle">Current page</p>
+        </div>
+        <button id="settings-open" type="button" class="icon-button" aria-label="Open settings">⚙️ Settings</button>
+      </header>
+
+      <section id="summary-view" class="view">
+        <div class="summary-toolbar">
+          <button id="summarize-button" type="button">✨ Regenerate</button>
+          <button id="copy-button" type="button" class="secondary" disabled>📋 Copy</button>
+        </div>
+
+        <p id="status" class="status" role="status"></p>
+        <div id="summary-result" class="summary-result" hidden></div>
+      </section>
+
+      <section id="settings-view" class="view" hidden>
+        <form id="settings-form" class="form">
+          <label class="field">
+            <span>DeepSeek API key</span>
+            <input id="api-key" type="password" autocomplete="off" placeholder="sk-..." spellcheck="false">
+          </label>
+
+          <label class="field">
+            <span>Model</span>
+            <select id="model">
+              <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+              <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Preferred captions</span>
+            <input id="preferred-caption-language" type="text" maxlength="12" placeholder="en">
+          </label>
+
+          <label class="field">
+            <span>Summary language</span>
+            <select id="summary-language">
+              <option value="same">Same as transcript</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Summary prompt (YouTube or article, depending on active tab)</span>
+            <textarea id="summary-prompt" rows="7" spellcheck="true"></textarea>
+          </label>
+
+          <label class="field">
+            <span>YouTube transcript character limit</span>
+            <input id="max-transcript-chars" type="number" min="20000" max="600000" step="10000">
+          </label>
+
+          <label class="field">
+            <span>Article character limit</span>
+            <input id="max-article-chars" type="number" min="20000" max="600000" step="10000">
+          </label>
+
+          <label class="toggle">
+            <input id="thinking-mode" type="checkbox">
+            <span>Use DeepSeek thinking mode</span>
+          </label>
+
+          <div class="actions">
+            <button type="submit">Save</button>
+            <button id="clear-key" type="button" class="secondary">Clear key</button>
+          </div>
+
+          <p id="settings-status" class="status" role="status"></p>
+        </form>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
