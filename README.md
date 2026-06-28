@@ -82,7 +82,7 @@ Manual deploy from the Mac mini to your MacBook over SSH, triggered from GitHub 
 
 1. Ensure SSH works to the MacBook:
    ```sh
-   ssh atrium-macbook 'echo ok'
+   ssh macbook 'echo ok'
    ```
 2. Register a self-hosted runner on the Mac mini:
    ```sh
@@ -93,7 +93,7 @@ Manual deploy from the Mac mini to your MacBook over SSH, triggered from GitHub 
    ```
    For a persistent runner: `sudo ./svc.sh install && sudo ./svc.sh start` in that directory.
 
-The runner must run under the user whose `~/.ssh/config` contains the MacBook host (e.g. `atrium-macbook`).
+The runner must run under the user whose `~/.ssh/config` contains the MacBook host (e.g. `macbook`).
 
 ### One-time setup (MacBook)
 
@@ -103,11 +103,11 @@ The runner must run under the user whose `~/.ssh/config` contains the MacBook ho
 ### Deploy
 
 1. Open GitHub → **Actions** → **Deploy to MacBook** → **Run workflow**
-2. Choose SSH host (`atrium-macbook` by default)
+2. Choose SSH host (`macbook` by default)
 3. After deploy, click **Reload** on the extension in Chrome (the workflow can open `chrome://extensions` for you)
 
 ### Deploy manually (without GitHub)
 
 ```sh
-./scripts/install-remote.sh atrium-macbook --open-extensions
+./scripts/install-remote.sh macbook --open-extensions
 ```

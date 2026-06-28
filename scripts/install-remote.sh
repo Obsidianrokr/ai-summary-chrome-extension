@@ -5,7 +5,7 @@
 #   scripts/install-remote.sh [ssh-host] [--open-extensions]
 #
 # Examples:
-#   scripts/install-remote.sh atrium-macbook
+#   scripts/install-remote.sh macbook
 #   scripts/install-remote.sh macbook --open-extensions
 #
 # Requires passwordless SSH (key in ~/.ssh/config). Installs to
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HOST="${1:-atrium-macbook}"
+HOST="${1:-macbook}"
 OPEN_EXTENSIONS=false
 
 shift || true

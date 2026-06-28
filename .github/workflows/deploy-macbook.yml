@@ -6,7 +6,7 @@ on:
       ssh_host:
         description: SSH host alias from ~/.ssh/config
         required: true
-        default: atrium-macbook
+        default: macbook
         type: string
       open_extensions:
         description: Open chrome://extensions on the MacBook after deploy
