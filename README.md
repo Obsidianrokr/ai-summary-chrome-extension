@@ -73,3 +73,41 @@ python3 -m json.tool manifest.json
 ## Research
 
 Open-source extensions studied in `research/` (xTil, TL;DR) — not shipped with the extension.
+
+## Deploy to MacBook (GitHub Actions)
+
+Manual deploy from the Mac mini to your MacBook over SSH, triggered from GitHub Actions.
+
+### One-time setup (Mac mini)
+
+1. Ensure SSH works to the MacBook:
+   ```sh
+   ssh atrium-macbook 'echo ok'
+   ```
+2. Register a self-hosted runner on the Mac mini:
+   ```sh
+   cd /Users/vemelianov/projects/ai-summary-chrome-extension
+   chmod +x scripts/setup-runner.sh scripts/install-remote.sh
+   ./scripts/setup-runner.sh
+   cd ~/actions-runners/ai-summary-chrome-extension && ./run.sh
+   ```
+   For a persistent runner: `sudo ./svc.sh install && sudo ./svc.sh start` in that directory.
+
+The runner must run under the user whose `~/.ssh/config` contains the MacBook host (e.g. `atrium-macbook`).
+
+### One-time setup (MacBook)
+
+1. Enable **Remote Login** (System Settings → General → Sharing)
+2. In Chrome: `chrome://extensions` → **Developer mode** → **Load unpacked** → select `~/vscode/ai-summary-chrome-extension`
+
+### Deploy
+
+1. Open GitHub → **Actions** → **Deploy to MacBook** → **Run workflow**
+2. Choose SSH host (`atrium-macbook` by default)
+3. After deploy, click **Reload** on the extension in Chrome (the workflow can open `chrome://extensions` for you)
+
+### Deploy manually (without GitHub)
+
+```sh
+./scripts/install-remote.sh atrium-macbook --open-extensions
+```

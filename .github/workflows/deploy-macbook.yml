@@ -1,0 +1,42 @@
+name: Deploy to MacBook
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_host:
+        description: SSH host alias from ~/.ssh/config
+        required: true
+        default: atrium-macbook
+        type: string
+      open_extensions:
+        description: Open chrome://extensions on the MacBook after deploy
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run smoke tests on Mac mini
+        run: |
+          node tests/extractor-smoke.test.mjs
+          node tests/renderer-smoke.test.mjs
+          node tests/chunker-smoke.test.mjs
+          node --check popup.js
+          node --check src/background.js
+          node --check src/lib/chunker.js
+          node --check src/lib/prompts.js
+          python3 -m json.tool manifest.json > /dev/null
+
+      - name: Deploy to MacBook over SSH
+        run: |
+          chmod +x scripts/install-remote.sh
+          ARGS="${{ inputs.ssh_host }}"
+          if [ "${{ inputs.open_extensions }}" = "true" ]; then
+            ARGS="${ARGS} --open-extensions"
+          fi
+          ./scripts/install-remote.sh ${ARGS}
