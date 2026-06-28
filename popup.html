@@ -9,17 +9,20 @@
   <body>
     <main class="popup">
       <header class="header">
-        <div>
-          <h1>AI Page & YouTube Summary</h1>
-          <p id="subtitle">Current page</p>
+        <div class="brand">
+          <img class="brand-icon" src="icons/icon32.png" alt="">
+          <div class="brand-copy">
+            <h1>AI Summary</h1>
+            <p id="subtitle">Current page</p>
+          </div>
         </div>
-        <button id="settings-open" type="button" class="icon-button" aria-label="Open settings">⚙️ Settings</button>
+        <button id="settings-open" type="button" class="icon-button" aria-label="Open settings">Settings</button>
       </header>
 
       <section id="summary-view" class="view">
         <div class="summary-toolbar">
-          <button id="summarize-button" type="button">✨ Regenerate</button>
-          <button id="copy-button" type="button" class="secondary" disabled>📋 Copy</button>
+          <button id="summarize-button" type="button">Regenerate</button>
+          <button id="copy-button" type="button" class="secondary" disabled>Copy</button>
         </div>
 
         <p id="status" class="status" role="status"></p>

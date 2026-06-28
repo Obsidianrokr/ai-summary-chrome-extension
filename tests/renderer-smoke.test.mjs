@@ -17,7 +17,9 @@ const html = context.__render([
   "",
   "**Key Points**",
   "- First point",
-  "- Second **point**"
+  "- Second **point**",
+  "",
+  "Site: example.com | Source: readability | Tokens: 1,234"
 ].join("\n"));
 
 assert.match(html, /<h2>🧠 Summary<\/h2>/);
@@ -25,6 +27,7 @@ assert.match(html, /<strong>important<\/strong>/);
 assert.match(html, /<code>safe<\/code>/);
 assert.match(html, /<h2>✅ Key Points<\/h2>/);
 assert.match(html, /<ul><li>First point<\/li><li>Second <strong>point<\/strong><\/li><\/ul>/);
+assert.match(html, /<div class="summary-meta"><span>Site: example\.com<\/span><span>Source: readability<\/span><span>Tokens: 1,234<\/span><\/div>/);
 assert.doesNotMatch(html, /\*\*Summary\*\*/);
 
 console.log("renderer smoke tests passed");
