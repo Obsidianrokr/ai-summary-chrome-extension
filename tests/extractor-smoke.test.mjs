@@ -4,6 +4,8 @@ import vm from "node:vm";
 
 const popupSource = fs.readFileSync(new URL("../popup.js", import.meta.url), "utf8");
 const extractorSource = extractFunctionSource(popupSource, "extractYouTubeTranscriptFromPage");
+const playerResponseExtractorSource = extractFunctionSource(popupSource, "extractTranscriptViaPlayerResponse");
+const loadTranscriptSource = extractFunctionSource(popupSource, "loadTranscriptViaPlayerResponse");
 const articleExtractorSource = extractFunctionSource(popupSource, "extractArticleFromPage");
 
 await testVisibleTranscriptPanel();
@@ -12,6 +14,11 @@ await testVisibleTextTranscriptFallback();
 await testChoosesExpandedTranscriptPanel();
 await testModernTranscriptPanel();
 await testEmptyPanelFallsBackToCaptionTracks();
+await testPlayerResponseExtractorHandlesBracesInsideStrings();
+await testPlayerResponseExtractorTriesAlternateCaptionFormats();
+await testLoadTranscriptUsesTimedtextInterceptBeforePanelFallback();
+await testLoadTranscriptUsesPanelFallbackAfterCaptionDownloadFailure();
+await testLoadTranscriptReportsLatestFallbackError();
 await testArticleSemanticDomFallback();
 await testArticlePreviewPaywallMessage();
 await testArticleRegistrationWallMessage();
@@ -19,8 +26,10 @@ await testArticleRegistrationWallMessage();
 console.log("extractor smoke tests passed");
 
 function extractFunctionSource(source, functionName) {
-  const marker = `async function ${functionName}`;
-  const start = source.indexOf(marker);
+  const asyncMarker = `async function ${functionName}`;
+  const functionMarker = `function ${functionName}`;
+  const asyncStart = source.indexOf(asyncMarker);
+  const start = asyncStart !== -1 ? asyncStart : source.indexOf(functionMarker);
   assert.notEqual(start, -1, `Could not find ${functionName}`);
 
   const braceStart = source.indexOf("{", start);
@@ -28,9 +37,27 @@ function extractFunctionSource(source, functionName) {
   let inString = false;
   let stringQuote = "";
   let escaped = false;
+  let inLineComment = false;
+  let inBlockComment = false;
 
   for (let index = braceStart; index < source.length; index += 1) {
     const char = source[index];
+    const nextChar = source[index + 1];
+
+    if (inLineComment) {
+      if (char === "\n") {
+        inLineComment = false;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (char === "*" && nextChar === "/") {
+        inBlockComment = false;
+        index += 1;
+      }
+      continue;
+    }
 
     if (inString) {
       if (escaped) {
@@ -41,6 +68,18 @@ function extractFunctionSource(source, functionName) {
         inString = false;
         stringQuote = "";
       }
+      continue;
+    }
+
+    if (char === "/" && nextChar === "/") {
+      inLineComment = true;
+      index += 1;
+      continue;
+    }
+
+    if (char === "/" && nextChar === "*") {
+      inBlockComment = true;
+      index += 1;
       continue;
     }
 
@@ -221,6 +260,344 @@ async function runArticleExtractor(fixture) {
   vm.createContext(context);
   vm.runInContext(`${articleExtractorSource}; globalThis.__articleExtractor = extractArticleFromPage;`, context);
   return await context.__articleExtractor();
+}
+
+async function runPlayerResponseExtractor(fixture) {
+  const context = {
+    console,
+    document: fixture.document,
+    fetch: fixture.fetch,
+    window: fixture.window || {}
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(`${playerResponseExtractorSource}; globalThis.__playerExtractor = extractTranscriptViaPlayerResponse;`, context);
+  return await context.__playerExtractor("en");
+}
+
+async function testPlayerResponseExtractorHandlesBracesInsideStrings() {
+  const fetchCalls = [];
+  const playerResponse = {
+    videoDetails: {
+      title: "Creator setup } walkthrough",
+      author: "Fixture Blogger",
+      lengthSeconds: "92"
+    },
+    captions: {
+      playerCaptionsTracklistRenderer: {
+        captionTracks: [
+          {
+            baseUrl: "https://example.test/api/timedtext",
+            languageCode: "en",
+            name: { runs: [{ text: "English" }] }
+          }
+        ]
+      }
+    }
+  };
+  const fixture = {
+    document: {
+      querySelectorAll(selector) {
+        if (selector === "script") {
+          return [{ textContent: `window["ytInitialPlayerResponse"] = ${JSON.stringify(playerResponse)};` }];
+        }
+        return [];
+      }
+    },
+    async fetch(url) {
+      fetchCalls.push(String(url));
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            events: [
+              { tStartMs: 0, segs: [{ utf8: "First caption line." }] },
+              { tStartMs: 4200, segs: [{ utf8: "Second caption line." }] }
+            ]
+          };
+        }
+      };
+    }
+  };
+  const result = await runPlayerResponseExtractor(fixture);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.title, "Creator setup } walkthrough");
+  assert.equal(result.channel, "Fixture Blogger");
+  assert.equal(result.duration, "1:32");
+  assert.equal(result.meta.label, "English");
+  assert.match(result.transcript, /\[0:00\] First caption line\./);
+  assert.match(result.transcript, /\[0:04\] Second caption line\./);
+  assert.equal(fetchCalls[0], "https://example.test/api/timedtext?fmt=json3");
+}
+
+async function testPlayerResponseExtractorTriesAlternateCaptionFormats() {
+  const fetchCalls = [];
+  const playerResponse = {
+    videoDetails: {
+      title: "Blogger caption format fallback",
+      author: "Fixture Blogger",
+      lengthSeconds: "12"
+    },
+    captions: {
+      playerCaptionsTracklistRenderer: {
+        captionTracks: [
+          {
+            baseUrl: "https://example.test/api/timedtext",
+            languageCode: "en",
+            name: { simpleText: "English" }
+          }
+        ]
+      }
+    }
+  };
+  const fixture = {
+    window: { ytInitialPlayerResponse: playerResponse },
+    document: {
+      querySelectorAll() {
+        return [];
+      }
+    },
+    async fetch(url) {
+      fetchCalls.push(String(url));
+      if (String(url).includes("fmt=json3")) {
+        return {
+          ok: false,
+          status: 429,
+          async text() {
+            return "rate limited";
+          }
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return [
+            "WEBVTT",
+            "",
+            "00:00:01.000 --> 00:00:03.000",
+            "First VTT fallback line.",
+            "",
+            "00:00:04.000 --> 00:00:06.000",
+            "Second VTT fallback line."
+          ].join("\n");
+        }
+      };
+    }
+  };
+  const result = await runPlayerResponseExtractor(fixture);
+
+  assert.equal(result.ok, true);
+  assert.equal(fetchCalls[0], "https://example.test/api/timedtext?fmt=json3");
+  assert.equal(fetchCalls[1], "https://example.test/api/timedtext?fmt=vtt");
+  assert.match(result.transcript, /First VTT fallback line\./);
+  assert.match(result.transcript, /Second VTT fallback line\./);
+}
+
+async function testLoadTranscriptUsesTimedtextInterceptBeforePanelFallback() {
+  const executeCalls = [];
+  let tabMessage = null;
+  let backgroundFallbackCalled = false;
+  const context = {
+    console,
+    activePage: {
+      videoId: "fixture12345",
+      title: "Active fixture video"
+    },
+    DEFAULT_SETTINGS: {
+      preferredCaptionLanguage: "en"
+    },
+    setStatus() {},
+    chrome: {
+      scripting: {
+        async executeScript(options) {
+          executeCalls.push(options.func.name);
+          if (options.func.name === "extractTranscriptViaPlayerResponse") {
+            return [{
+              result: {
+                ok: false,
+                error: "Caption download failed (429)."
+              }
+            }];
+          }
+
+          throw new Error("Transcript panel fallback should not run after timedtext interception succeeds.");
+        }
+      },
+      tabs: {
+        async sendMessage(tabId, message) {
+          tabMessage = { tabId, message };
+          return {
+            ok: true,
+            transcript: "[0:00] Intercepted timedtext line.",
+            title: "Timedtext fixture video",
+            channel: "Fixture Blogger",
+            duration: "0:42",
+            meta: {
+              label: "YouTube player captions",
+              languageCode: "en",
+              source: "youtube-player-timedtext"
+            }
+          };
+        }
+      },
+      runtime: {
+        async sendMessage() {
+          backgroundFallbackCalled = true;
+          return {
+            ok: false,
+            error: "Background fallback should not run after timedtext interception succeeds."
+          };
+        }
+      }
+    }
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext([
+    extractorSource,
+    playerResponseExtractorSource,
+    loadTranscriptSource,
+    "globalThis.__loadTranscript = loadTranscriptViaPlayerResponse;"
+  ].join("\n"), context);
+
+  const result = await context.__loadTranscript(123, "en");
+
+  assert.deepEqual(executeCalls, ["extractTranscriptViaPlayerResponse"]);
+  assert.equal(tabMessage.tabId, 123);
+  assert.equal(tabMessage.message.type, "captureYouTubeTimedtextTranscript");
+  assert.equal(tabMessage.message.preferredLanguage, "en");
+  assert.equal(backgroundFallbackCalled, false);
+  assert.equal(result.transcript, "[0:00] Intercepted timedtext line.");
+  assert.equal(result.transcriptMeta.source, "youtube-player-timedtext");
+  assert.equal(result.title, "Timedtext fixture video");
+}
+
+async function testLoadTranscriptUsesPanelFallbackAfterCaptionDownloadFailure() {
+  const executeCalls = [];
+  const context = {
+    console,
+    activePage: {
+      videoId: "fixture12345",
+      title: "Active fixture video"
+    },
+    DEFAULT_SETTINGS: {
+      preferredCaptionLanguage: "en"
+    },
+    setStatus() {},
+    chrome: {
+      scripting: {
+        async executeScript(options) {
+          executeCalls.push(options.func.name);
+          if (options.func.name === "extractTranscriptViaPlayerResponse") {
+            return [{
+              result: {
+                ok: false,
+                error: "Caption download failed (429)."
+              }
+            }];
+          }
+
+          if (options.func.name === "extractYouTubeTranscriptFromPage") {
+            return [{
+              result: {
+                ok: true,
+                transcript: "[0:00] Panel transcript line.",
+                title: "Panel fixture video",
+                channel: "Fixture Blogger",
+                duration: "0:20",
+                meta: {
+                  label: "YouTube transcript panel",
+                  source: "youtube-transcript-panel"
+                }
+              }
+            }];
+          }
+
+          throw new Error(`Unexpected executeScript call: ${options.func.name}`);
+        }
+      },
+      runtime: {
+        async sendMessage() {
+          return {
+            ok: false,
+            error: "Background caption download should not run before the panel fallback."
+          };
+        }
+      }
+    }
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext([
+    extractorSource,
+    playerResponseExtractorSource,
+    loadTranscriptSource,
+    "globalThis.__loadTranscript = loadTranscriptViaPlayerResponse;"
+  ].join("\n"), context);
+
+  const result = await context.__loadTranscript(123, "en");
+
+  assert.deepEqual(executeCalls, [
+    "extractTranscriptViaPlayerResponse",
+    "extractYouTubeTranscriptFromPage"
+  ]);
+  assert.equal(result.transcript, "[0:00] Panel transcript line.");
+  assert.equal(result.transcriptMeta.source, "youtube-transcript-panel");
+  assert.equal(result.title, "Panel fixture video");
+}
+
+async function testLoadTranscriptReportsLatestFallbackError() {
+  const context = {
+    console,
+    activePage: {
+      videoId: "fixture12345",
+      title: "Active fixture video"
+    },
+    DEFAULT_SETTINGS: {
+      preferredCaptionLanguage: "en"
+    },
+    setStatus() {},
+    chrome: {
+      scripting: {
+        async executeScript(options) {
+          if (options.func.name === "extractTranscriptViaPlayerResponse") {
+            return [{ result: { ok: false, error: "Caption download failed (429)." } }];
+          }
+
+          if (options.func.name === "extractYouTubeTranscriptFromPage") {
+            return [{ result: { ok: false, error: "Transcript panel opened, but YouTube did not return transcript rows." } }];
+          }
+
+          throw new Error(`Unexpected executeScript call: ${options.func.name}`);
+        }
+      },
+      runtime: {
+        async sendMessage() {
+          return {
+            ok: false,
+            error: "YouTube is rate-limiting caption downloads (429). Wait a few minutes, reload the YouTube tab, then click the extension again."
+          };
+        }
+      }
+    }
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext([
+    extractorSource,
+    playerResponseExtractorSource,
+    loadTranscriptSource,
+    "globalThis.__loadTranscript = loadTranscriptViaPlayerResponse;"
+  ].join("\n"), context);
+
+  await assert.rejects(
+    () => context.__loadTranscript(123, "en"),
+    /rate-limiting caption downloads/
+  );
 }
 
 async function testArticleSemanticDomFallback() {

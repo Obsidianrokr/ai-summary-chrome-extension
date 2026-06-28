@@ -27,6 +27,37 @@ const DEFAULT_SETTINGS = {
 const DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions";
 const WATCH_URL = "https://www.youtube.com/watch";
 const REQUEST_TIMEOUT_MS = 120000;
+const YOUTUBE_TIMEDTEXT_URL_FILTER = {
+  urls: [
+    "*://youtube.com/api/timedtext?*",
+    "*://*.youtube.com/api/timedtext?*"
+  ]
+};
+
+if (chrome.webRequest?.onBeforeRequest) {
+  chrome.webRequest.onBeforeRequest.addListener(
+    relayYouTubeTimedtextRequest,
+    YOUTUBE_TIMEDTEXT_URL_FILTER
+  );
+}
+
+function relayYouTubeTimedtextRequest(details) {
+  if (!details?.url || typeof details.tabId !== "number" || details.tabId < 0) {
+    return;
+  }
+
+  try {
+    const maybePromise = chrome.tabs.sendMessage(details.tabId, {
+      type: "youtubeTimedtextUrl",
+      url: details.url
+    });
+    if (maybePromise && typeof maybePromise.catch === "function") {
+      maybePromise.catch(() => {});
+    }
+  } catch (_error) {
+    // The YouTube tab may not have the capture content script yet.
+  }
+}
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message.type !== "string") {
@@ -47,10 +78,44 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "getTranscript") {
+    loadTranscriptForVideo(message.payload?.videoId, message.payload?.preferredLanguage)
+      .then((result) => sendResponse({ ok: true, result }))
+      .catch((error) => sendResponse({ ok: false, error: getErrorMessage(error) }));
+    return true;
+  }
+
   return false;
 });
 
-async function summarizeContent(payload = {}) {
+// Streaming summaries: the popup opens a port and receives deltas as DeepSeek writes.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "summarize-stream") {
+    return;
+  }
+
+  let started = false;
+  port.onMessage.addListener((message) => {
+    if (started || message?.type !== "start") {
+      return;
+    }
+    started = true;
+
+    summarizeContent(message.payload, (delta) => {
+      try { port.postMessage({ type: "delta", text: delta }); } catch (_error) {}
+    })
+      .then((result) => {
+        try { port.postMessage({ type: "done", result }); } catch (_error) {}
+        try { port.disconnect(); } catch (_error) {}
+      })
+      .catch((error) => {
+        try { port.postMessage({ type: "error", error: getErrorMessage(error) }); } catch (_error) {}
+        try { port.disconnect(); } catch (_error) {}
+      });
+  });
+});
+
+async function summarizeContent(payload = {}, onDelta = null) {
   const settings = await getSettings();
   const apiKey = settings.apiKey.trim();
 
@@ -81,6 +146,8 @@ async function summarizeContent(payload = {}) {
     contextWindow: normalizeContextWindow(settings.contextWindow)
   });
 
+  const targetLanguage = resolveTargetLanguage(settings, contentType, payload, processedContent);
+
   const summary = chunks.length === 1
     ? await oneShotSummarize({
       apiKey,
@@ -88,7 +155,9 @@ async function summarizeContent(payload = {}) {
       contentType,
       systemPrompt,
       metadata,
-      content: chunks[0]
+      content: chunks[0],
+      targetLanguage,
+      onDelta
     })
     : await rollingSummarize({
       apiKey,
@@ -96,7 +165,9 @@ async function summarizeContent(payload = {}) {
       contentType,
       systemPrompt,
       metadata,
-      chunks
+      chunks,
+      targetLanguage,
+      onDelta
     });
 
   return {
@@ -112,11 +183,14 @@ async function oneShotSummarize({
   contentType,
   systemPrompt,
   metadata,
-  content
+  content,
+  targetLanguage,
+  onDelta
 }) {
   const body = buildChatRequest({
     settings,
     systemPrompt,
+    targetLanguage,
     userPrompt: buildUserPrompt({
       contentType,
       metadata,
@@ -126,6 +200,11 @@ async function oneShotSummarize({
     }),
     maxTokens: 1800
   });
+
+  if (onDelta) {
+    const streamed = await callDeepSeekStreaming(apiKey, body, onDelta);
+    return { text: ensureSummaryText(streamed.text), usage: streamed.usage || null };
+  }
 
   const data = await callDeepSeek(apiKey, body);
   return {
@@ -140,7 +219,9 @@ async function rollingSummarize({
   contentType,
   systemPrompt,
   metadata,
-  chunks
+  chunks,
+  targetLanguage,
+  onDelta
 }) {
   let rollingSummary = "";
 
@@ -160,9 +241,15 @@ async function rollingSummarize({
     const body = buildChatRequest({
       settings,
       systemPrompt: activeSystemPrompt,
+      targetLanguage: isLast ? targetLanguage : null,
       userPrompt,
       maxTokens: isLast ? 2200 : 1600
     });
+
+    if (isLast && onDelta) {
+      const streamed = await callDeepSeekStreaming(apiKey, body, onDelta);
+      return { text: ensureSummaryText(streamed.text), usage: streamed.usage || null };
+    }
 
     const data = await callDeepSeek(apiKey, body);
     const responseText = extractSummaryText(data);
@@ -180,10 +267,10 @@ async function rollingSummarize({
   throw new Error("DeepSeek returned an empty summary.");
 }
 
-function buildChatRequest({ settings, systemPrompt, userPrompt, maxTokens }) {
-  const languageInstruction = settings.summaryLanguage === "en"
-    ? "Write the summary in English."
-    : "Write the summary in the same language as the source when possible.";
+function buildChatRequest({ settings, systemPrompt, userPrompt, maxTokens, targetLanguage }) {
+  const languageInstruction = targetLanguage?.name
+    ? `Write the ENTIRE summary, including every heading and bullet, in ${targetLanguage.name}. Do not switch languages or mix in another language, regardless of the language of these instructions or examples.`
+    : "Write the summary in the same language as the source transcript or article. Do not translate it into another language.";
 
   const request = {
     model: settings.model || DEFAULT_SETTINGS.model,
@@ -234,6 +321,199 @@ function extractSummaryText(data) {
     throw new Error("DeepSeek returned an empty summary.");
   }
   return summary;
+}
+
+function ensureSummaryText(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) {
+    throw new Error("DeepSeek returned an empty summary.");
+  }
+  return trimmed;
+}
+
+async function callDeepSeekStreaming(apiKey, body, onDelta) {
+  const response = await fetchWithTimeout(DEEPSEEK_CHAT_COMPLETIONS_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({ ...body, stream: true })
+  });
+
+  if (!response.ok) {
+    const data = await parseJsonResponse(response);
+    throw new Error(formatDeepSeekError(response.status, data));
+  }
+
+  // Fallback if the platform does not expose a readable stream.
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const data = await parseJsonResponse(response);
+    const text = extractSummaryText(data);
+    onDelta(text);
+    return { text, usage: data?.usage || null };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let full = "";
+  let usage = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) {
+        continue;
+      }
+      const data = trimmed.slice(5).trim();
+      if (!data || data === "[DONE]") {
+        continue;
+      }
+      let json;
+      try {
+        json = JSON.parse(data);
+      } catch (_error) {
+        continue;
+      }
+      const delta = json.choices?.[0]?.delta?.content || "";
+      if (delta) {
+        full += delta;
+        onDelta(delta);
+      }
+      if (json.usage) {
+        usage = json.usage;
+      }
+    }
+  }
+
+  return { text: full, usage };
+}
+
+const LANGUAGE_NAMES = {
+  en: "English", es: "Spanish", fr: "French", de: "German", it: "Italian",
+  pt: "Portuguese", nl: "Dutch", pl: "Polish", ru: "Russian", uk: "Ukrainian",
+  tr: "Turkish", sv: "Swedish", cs: "Czech", ro: "Romanian", el: "Greek",
+  hu: "Hungarian", fi: "Finnish", da: "Danish", no: "Norwegian", id: "Indonesian",
+  vi: "Vietnamese", th: "Thai", ar: "Arabic", fa: "Persian", he: "Hebrew",
+  hi: "Hindi", ja: "Japanese", ko: "Korean", zh: "Chinese"
+};
+
+function languageEntry(code) {
+  const normalized = String(code || "").toLowerCase().split(/[-_]/)[0];
+  if (normalized && LANGUAGE_NAMES[normalized]) {
+    return { code: normalized, name: LANGUAGE_NAMES[normalized] };
+  }
+  return null;
+}
+
+// Decide which language the summary should be written in.
+// Auto rule: Russian source -> Russian, Czech source -> Czech, everything else -> English.
+function resolveTargetLanguage(settings, contentType, payload, content) {
+  const requested = String(settings.summaryLanguage || "same").toLowerCase();
+
+  // An explicit manual choice always wins.
+  if (requested && requested !== "same" && requested !== "auto") {
+    const explicit = languageEntry(requested);
+    if (explicit) {
+      return explicit;
+    }
+  }
+
+  const detected = detectSourceLanguageCode(payload, content);
+  if (detected === "ru") {
+    return languageEntry("ru");
+  }
+  if (detected === "cs") {
+    return languageEntry("cs");
+  }
+  return languageEntry("en");
+}
+
+function detectSourceLanguageCode(payload, content) {
+  const known = languageEntry(
+    payload?.transcriptMeta?.languageCode ||
+    payload?.contentMeta?.languageCode ||
+    payload?.languageCode
+  );
+  if (known) {
+    return known.code;
+  }
+  const detected = detectLanguage(content);
+  return detected ? detected.code : null;
+}
+
+function detectLanguage(text) {
+  const sample = String(text || "").slice(0, 4000);
+  if (!sample.trim()) {
+    return null;
+  }
+
+  // Non-Latin writing systems are highly reliable signals.
+  const scripts = [
+    [/[\u3040-\u309F\u30A0-\u30FF]/g, "ja"],
+    [/[\uAC00-\uD7AF]/g, "ko"],
+    [/[\u4E00-\u9FFF]/g, "zh"],
+    [/[\u0E00-\u0E7F]/g, "th"],
+    [/[\u0590-\u05FF]/g, "he"],
+    [/[\u0600-\u06FF]/g, "ar"],
+    [/[\u0900-\u097F]/g, "hi"],
+    [/[\u0370-\u03FF]/g, "el"]
+  ];
+  for (const [re, code] of scripts) {
+    const matches = sample.match(re);
+    if (matches && matches.length > 12) {
+      return languageEntry(code);
+    }
+  }
+
+  // Cyrillic: Ukrainian has letters Russian lacks.
+  if ((sample.match(/[\u0400-\u04FF]/g) || []).length > 12) {
+    return /[іїєґ]/i.test(sample) ? languageEntry("uk") : languageEntry("ru");
+  }
+
+  // Czech uses Latin letters that are rare elsewhere (ř, ů, ě).
+  if ((sample.match(/[řůěŘŮĚ]/g) || []).length > 3) {
+    return languageEntry("cs");
+  }
+
+  // Latin scripts: score by frequent function words.
+  const lower = ` ${sample.toLowerCase().replace(/[^a-zà-ÿ\s]/g, " ")} `;
+  const stopwords = {
+    en: ["the", "and", "to", "of", "is", "that", "it", "you"],
+    es: ["el", "la", "que", "de", "los", "una", "para", "con"],
+    fr: ["le", "la", "les", "des", "que", "une", "pour", "est"],
+    de: ["der", "die", "und", "das", "ist", "nicht", "ein", "auch"],
+    pt: ["que", "de", "para", "uma", "com", "nao", "isso", "voce"],
+    it: ["che", "di", "il", "la", "per", "una", "non", "sono"],
+    nl: ["de", "het", "een", "dat", "niet", "van", "ook", "maar"],
+    pl: ["nie", "to", "sie", "jest", "na", "co", "jak", "tak"],
+    id: ["yang", "dan", "di", "ini", "untuk", "dengan", "tidak", "kita"],
+    tr: ["ve", "bir", "bu", "icin", "ile", "degil", "cok", "ama"]
+  };
+  let best = null;
+  let bestScore = 0;
+  for (const code of Object.keys(stopwords)) {
+    let score = 0;
+    for (const w of stopwords[code]) {
+      const m = lower.match(new RegExp(` ${w} `, "g"));
+      if (m) {
+        score += m.length;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = code;
+    }
+  }
+  return bestScore >= 3 ? languageEntry(best) : null;
 }
 
 function buildMetadata(contentType, payload, truncated, originalCharacters, submittedCharacters) {

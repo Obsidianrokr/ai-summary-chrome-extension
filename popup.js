@@ -48,6 +48,7 @@ const apiKeyInput = document.getElementById("api-key");
 const modelInput = document.getElementById("model");
 const thinkingModeInput = document.getElementById("thinking-mode");
 const summaryLanguageInput = document.getElementById("summary-language");
+const outputLanguageInput = document.getElementById("output-language");
 const summaryPromptInput = document.getElementById("summary-prompt");
 const preferredCaptionLanguageInput = document.getElementById("preferred-caption-language");
 const maxTranscriptCharsInput = document.getElementById("max-transcript-chars");
@@ -123,6 +124,9 @@ async function loadSettings() {
   modelInput.value = settings.model || DEFAULT_SETTINGS.model;
   thinkingModeInput.checked = settings.thinkingMode === "enabled";
   summaryLanguageInput.value = settings.summaryLanguage || DEFAULT_SETTINGS.summaryLanguage;
+  if (outputLanguageInput) {
+    outputLanguageInput.value = settings.summaryLanguage || DEFAULT_SETTINGS.summaryLanguage;
+  }
   summaryPromptInput.value = getPromptForPageType(settings, activePage?.contentType || "youtube");
   preferredCaptionLanguageInput.value = settings.preferredCaptionLanguage || DEFAULT_SETTINGS.preferredCaptionLanguage;
   maxTranscriptCharsInput.value = settings.maxTranscriptChars || DEFAULT_SETTINGS.maxTranscriptChars;
@@ -162,6 +166,9 @@ async function saveSettings() {
     maxArticleCharsInput.value = nextSettings.maxArticleChars;
   }
   setSettingsStatus("✅ Settings saved.");
+  if (outputLanguageInput) {
+    outputLanguageInput.value = nextSettings.summaryLanguage;
+  }
   showSummary();
 
   if (activePage && nextSettings.apiKey) {
@@ -241,6 +248,527 @@ async function loadTranscriptFromActiveTab(tabId, preferredLanguage) {
   }
 }
 
+async function loadTranscriptViaPlayerResponse(tabId, preferredLanguage) {
+  const language = preferredLanguage || DEFAULT_SETTINGS.preferredCaptionLanguage;
+  let pageError = "";
+  const rememberError = (message) => {
+    if (message) {
+      pageError = message;
+    }
+  };
+
+  // Primary: read captions straight from the live page's player response.
+  // This never opens the transcript panel, so the tab does not visibly change.
+  if (tabId && chrome.scripting?.executeScript) {
+    setStatus("📖 Fetching captions...");
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: extractTranscriptViaPlayerResponse,
+        args: [language]
+      });
+      const result = results?.[0]?.result;
+      if (result?.ok && result.transcript) {
+        return {
+          transcript: result.transcript,
+          transcriptMeta: result.meta || {},
+          title: result.title || activePage?.title || "",
+          channel: result.channel || "",
+          duration: result.duration || ""
+        };
+      }
+      rememberError(result?.error || "");
+    } catch (error) {
+      rememberError(error?.message || String(error));
+    }
+  }
+
+  // Fallback: trigger the real YouTube player caption request and let the
+  // content script fetch the exact timedtext URL observed by webRequest.
+  if (tabId && chrome.tabs?.sendMessage) {
+    setStatus("📖 Asking the YouTube player for captions...");
+    try {
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: "captureYouTubeTimedtextTranscript",
+        preferredLanguage: language
+      });
+      if (result?.ok && result.transcript) {
+        return {
+          transcript: result.transcript,
+          transcriptMeta: result.meta || {},
+          title: result.title || activePage?.title || "",
+          channel: result.channel || "",
+          duration: result.duration || ""
+        };
+      }
+      rememberError(result?.error || "");
+    } catch (error) {
+      rememberError(error?.message || String(error));
+    }
+  }
+
+  // Fallback: open/read the transcript panel from the live page. This can still
+  // work when YouTube rate-limits caption URL downloads.
+  if (tabId && chrome.scripting?.executeScript) {
+    setStatus("📖 Reading the YouTube transcript panel...");
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: extractYouTubeTranscriptFromPage,
+        args: [language]
+      });
+      const result = results?.[0]?.result;
+      if (result?.ok && result.transcript) {
+        return {
+          transcript: result.transcript,
+          transcriptMeta: result.meta || {},
+          title: result.title || activePage?.title || "",
+          channel: result.channel || "",
+          duration: result.duration || ""
+        };
+      }
+      rememberError(result?.error || "");
+    } catch (error) {
+      rememberError(error?.message || String(error));
+    }
+  }
+
+  // Last fallback: let the background fetch the player response server-side.
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "getTranscript",
+      payload: { videoId: activePage?.videoId, preferredLanguage: language }
+    });
+    if (response?.ok && response.result?.transcript) {
+      const result = response.result;
+      return {
+        transcript: result.transcript,
+        transcriptMeta: result.meta || {},
+        title: result.title || activePage?.title || "",
+        channel: result.channel || "",
+        duration: result.duration || ""
+      };
+    }
+    rememberError(response?.error || "");
+  } catch (error) {
+    rememberError(error?.message || String(error));
+  }
+
+  throw new Error(pageError || "Could not read captions for this video.");
+}
+
+// Injected into the YouTube page (MAIN world). Reads ytInitialPlayerResponse and
+// downloads the caption track directly — no transcript panel, no UI change.
+function extractTranscriptViaPlayerResponse(preferredLanguage) {
+  function findPlayerResponse() {
+    if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.captions) {
+      return window.ytInitialPlayerResponse;
+    }
+
+    const scripts = document.querySelectorAll("script");
+    for (const script of scripts) {
+      const response = extractYtInitialPlayerResponse(script.textContent || "");
+      if (response?.captions) {
+        return response;
+      }
+    }
+
+    return window.ytInitialPlayerResponse || null;
+  }
+
+  function extractYtInitialPlayerResponse(source) {
+    const markers = [
+      "ytInitialPlayerResponse =",
+      "ytInitialPlayerResponse=",
+      "window[\"ytInitialPlayerResponse\"] =",
+      "window['ytInitialPlayerResponse'] =",
+      "\"ytInitialPlayerResponse\":"
+    ];
+
+    for (const marker of markers) {
+      const markerIndex = source.indexOf(marker);
+      if (markerIndex === -1) {
+        continue;
+      }
+
+      const objectStart = source.indexOf("{", markerIndex + marker.length);
+      if (objectStart === -1) {
+        continue;
+      }
+
+      const jsonText = readBalancedJsonObject(source, objectStart);
+      if (!jsonText) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(jsonText);
+        if (parsed?.captions || parsed?.videoDetails) {
+          return parsed;
+        }
+      } catch (_error) {
+        continue;
+      }
+    }
+
+    return null;
+  }
+
+  function readBalancedJsonObject(source, startIndex) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = startIndex; index < source.length; index += 1) {
+      const char = source[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === "\"") {
+        inString = true;
+        continue;
+      }
+
+      if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return source.slice(startIndex, index + 1);
+        }
+      }
+    }
+
+    return "";
+  }
+
+  function trackLabel(track) {
+    if (track.name && track.name.simpleText) {
+      return track.name.simpleText;
+    }
+    if (track.name && Array.isArray(track.name.runs)) {
+      return track.name.runs.map((run) => run.text || "").join("").trim();
+    }
+    return track.languageCode || "captions";
+  }
+
+  function buildCaptionUrl(baseUrl, format) {
+    if (!format) {
+      return baseUrl;
+    }
+
+    if (new RegExp(`[?&]fmt=${format}(?:&|$)`).test(baseUrl)) {
+      return baseUrl;
+    }
+
+    const separator = baseUrl.includes("?") ? "&" : "?";
+    return `${baseUrl}${separator}fmt=${encodeURIComponent(format)}`;
+  }
+
+  async function readResponseText(response) {
+    if (typeof response.text === "function") {
+      return await response.text();
+    }
+
+    if (typeof response.json === "function") {
+      return JSON.stringify(await response.json());
+    }
+
+    return "";
+  }
+
+  function parseCaptionResponse(text, format) {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    if (format === "json3" || trimmed.startsWith("{")) {
+      try {
+        return parseJson3Captions(JSON.parse(trimmed));
+      } catch (_error) {
+        return "";
+      }
+    }
+
+    if (format === "vtt" || trimmed.startsWith("WEBVTT")) {
+      return parseVttCaptions(trimmed);
+    }
+
+    if (trimmed.includes("<text") || trimmed.includes("<p ")) {
+      return parseXmlCaptions(trimmed);
+    }
+
+    return trimmed
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function parseJson3Captions(captionJson) {
+    const events = Array.isArray(captionJson?.events) ? captionJson.events : [];
+    const lines = [];
+
+    for (const event of events) {
+      if (!Array.isArray(event.segs)) {
+        continue;
+      }
+
+      const text = event.segs
+        .map((segment) => segment?.utf8 || "")
+        .join("")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (text) {
+        lines.push(`[${formatTimestamp(event.tStartMs || 0)}] ${text}`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  function formatDuration(lengthSeconds) {
+    const seconds = Number(lengthSeconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return "";
+    }
+
+    return formatTimestamp(seconds * 1000);
+  }
+
+  function parseVttCaptions(vttText) {
+    return String(vttText || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => {
+        if (!line) return false;
+        if (line === "WEBVTT") return false;
+        if (/^\d+$/.test(line)) return false;
+        if (line.includes("-->")) return false;
+        if (line.startsWith("NOTE")) return false;
+        return true;
+      })
+      .map(stripHtmlTags)
+      .map(decodeHtmlEntities)
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function parseXmlCaptions(xmlText) {
+    const lines = [];
+    const textNodeRegex = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
+    const paragraphRegex = /<p\b([^>]*)>([\s\S]*?)<\/p>/g;
+
+    collectXmlCaptionLines(xmlText, textNodeRegex, "start", lines);
+    if (!lines.length) {
+      collectXmlCaptionLines(xmlText, paragraphRegex, "t", lines);
+    }
+
+    return lines.join("\n");
+  }
+
+  function collectXmlCaptionLines(xmlText, regex, timeAttribute, lines) {
+    let match = regex.exec(xmlText);
+    while (match) {
+      const attributes = match[1] || "";
+      const rawText = match[2] || "";
+      const text = decodeHtmlEntities(stripHtmlTags(rawText).replace(/\s+/g, " ").trim());
+      const timestamp = getXmlTimestamp(attributes, timeAttribute);
+
+      if (text) {
+        lines.push(timestamp ? `[${timestamp}] ${text}` : text);
+      }
+
+      match = regex.exec(xmlText);
+    }
+  }
+
+  function getXmlTimestamp(attributes, attributeName) {
+    const match = attributes.match(new RegExp(`${attributeName}="([^"]+)"`));
+    if (!match) {
+      return "";
+    }
+
+    const value = Number(match[1]);
+    if (!Number.isFinite(value)) {
+      return "";
+    }
+
+    return formatTimestamp(attributeName === "start" ? value * 1000 : value);
+  }
+
+  function stripHtmlTags(value) {
+    return String(value || "").replace(/<[^>]+>/g, "").trim();
+  }
+
+  function decodeHtmlEntities(value) {
+    return String(value || "").replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (entity, code) => {
+      if (code[0] === "#") {
+        const isHex = code[1]?.toLowerCase() === "x";
+        const numberText = isHex ? code.slice(2) : code.slice(1);
+        const number = Number.parseInt(numberText, isHex ? 16 : 10);
+        return Number.isFinite(number) ? String.fromCodePoint(number) : entity;
+      }
+
+      const namedEntities = {
+        amp: "&",
+        lt: "<",
+        gt: ">",
+        quot: "\"",
+        apos: "'",
+        nbsp: " "
+      };
+
+      return namedEntities[code] || entity;
+    });
+  }
+
+  function formatTimestamp(milliseconds) {
+    const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function run() {
+    const player = findPlayerResponse();
+    const tracks = (player && player.captions &&
+      player.captions.playerCaptionsTracklistRenderer &&
+      player.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+
+    if (!tracks.length) {
+      return Promise.resolve({ ok: false, error: "This video does not have captions the extension can read." });
+    }
+
+    const pref = String(preferredLanguage || "en").toLowerCase();
+    const prefBase = pref.split("-")[0];
+
+    function score(track) {
+      const lc = String(track.languageCode || "").toLowerCase();
+      let value = 0;
+      if (lc === pref) {
+        value += 100;
+      } else if (lc.split("-")[0] === prefBase) {
+        value += 60;
+      }
+      if (track.kind !== "asr") {
+        value += 10;
+      }
+      return value;
+    }
+
+    const ranked = tracks.slice().sort((a, b) => score(b) - score(a));
+    const title = (player.videoDetails && player.videoDetails.title) || "";
+    const channel = (player.videoDetails && player.videoDetails.author) || "";
+    const duration = formatDuration(player.videoDetails && player.videoDetails.lengthSeconds);
+
+    return (async () => {
+      let lastError = "Found caption tracks but could not download readable text.";
+      for (const track of ranked) {
+        if (!track.baseUrl) {
+          continue;
+        }
+
+        for (const format of ["json3", "vtt", "srv3", ""]) {
+          try {
+            const url = buildCaptionUrl(track.baseUrl, format);
+            const response = await fetch(url, { credentials: "include" });
+            if (!response.ok) {
+              lastError = `Caption download failed (${response.status}).`;
+              continue;
+            }
+            const transcript = parseCaptionResponse(await readResponseText(response), format);
+            if (transcript.trim()) {
+              return {
+                ok: true,
+                transcript,
+                title,
+                channel,
+                duration,
+                meta: {
+                  label: trackLabel(track),
+                  languageCode: track.languageCode || "",
+                  isAutoGenerated: track.kind === "asr",
+                  source: "caption-url-fallback"
+                }
+              };
+            }
+          } catch (error) {
+            lastError = (error && error.message) || String(error);
+          }
+        }
+      }
+      return { ok: false, error: lastError };
+    })();
+  }
+
+  return run();
+}
+
+function summarizeViaStream(payload, onPartial) {
+  return new Promise((resolve, reject) => {
+    let port;
+    try {
+      port = chrome.runtime.connect({ name: "summarize-stream" });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let settled = false;
+    let accumulated = "";
+
+    const finish = (fn, arg) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      try { port.disconnect(); } catch (_error) {}
+      fn(arg);
+    };
+
+    port.onMessage.addListener((message) => {
+      if (!message) {
+        return;
+      }
+      if (message.type === "delta") {
+        accumulated += message.text || "";
+        onPartial(accumulated);
+      } else if (message.type === "done") {
+        const result = message.result || {};
+        finish(resolve, { ...result, summary: result.summary ?? accumulated });
+      } else if (message.type === "error") {
+        finish(reject, new Error(message.error || "The extension could not summarize this page."));
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      finish(reject, new Error("The summary connection closed unexpectedly."));
+    });
+
+    port.postMessage({ type: "start", payload });
+  });
+}
+
 async function loadArticleFromActiveTab(tabId) {
   if (!tabId || !chrome.scripting?.executeScript) {
     throw new Error("Reload the extension in chrome://extensions/ so it can read article text from the active tab.");
@@ -311,7 +839,7 @@ async function summarizeCurrentPage({ force }) {
     let payload = { ...activePage };
 
     if (activePage.contentType === "youtube") {
-      const transcriptPayload = await loadTranscriptFromActiveTab(
+      const transcriptPayload = await loadTranscriptViaPlayerResponse(
         activePage.tabId,
         settings.preferredCaptionLanguage
       );
@@ -329,16 +857,11 @@ async function summarizeCurrentPage({ force }) {
       };
     }
 
-    const response = await chrome.runtime.sendMessage({
-      type: "summarizeContent",
-      payload
+    const result = await summarizeViaStream(payload, (partialText) => {
+      renderSummary(partialText);
     });
 
-    if (!response?.ok) {
-      throw new Error(response?.error || "The extension could not summarize this page.");
-    }
-
-    const { summary, contentMeta, usage } = response.result;
+    const { summary, contentMeta, usage } = result;
     const rendered = `${summary}\n\n${buildMetaLine(contentMeta, usage)}`;
     renderSummary(rendered);
     setStatus("✅ Summary ready.", "success");
@@ -1781,7 +2304,7 @@ async function saveSummaryCache(cacheKey, summary) {
 function showSettings() {
   summaryView.hidden = true;
   settingsView.hidden = false;
-  settingsOpenButton.textContent = "Summary";
+  settingsOpenButton.textContent = "Done";
   settingsOpenButton.setAttribute("aria-label", "Back to summary");
 }
 
@@ -1800,4 +2323,20 @@ function setStatus(message, state = "") {
 function setSettingsStatus(message, state = "") {
   settingsStatusNode.textContent = message;
   settingsStatusNode.className = `status${state ? ` ${state}` : ""}`;
+}
+
+if (outputLanguageInput) {
+  outputLanguageInput.addEventListener("change", async () => {
+    const value = outputLanguageInput.value;
+    if (summaryLanguageInput) {
+      summaryLanguageInput.value = value;
+    }
+    await chrome.storage.local.set({ summaryLanguage: value });
+    if (activePage) {
+      const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
+      if (stored.apiKey) {
+        await summarizeCurrentPage({ force: true });
+      }
+    }
+  });
 }
