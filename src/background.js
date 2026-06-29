@@ -124,7 +124,25 @@ async function summarizeContent(payload = {}, onDelta = null) {
   }
 
   const contentType = payload.contentType === "article" ? "article" : "youtube";
-  const rawContent = String(payload.content || "").trim();
+  let sourcePayload = { ...payload };
+  let rawContent = String(sourcePayload.content || "").trim();
+
+  if (!rawContent && contentType === "youtube") {
+    const videoId = normalizeVideoId(sourcePayload.videoId);
+    if (videoId) {
+      const transcriptPayload = await loadTranscriptForVideo(videoId, settings.preferredCaptionLanguage);
+      sourcePayload = {
+        ...sourcePayload,
+        title: sourcePayload.title || transcriptPayload.title,
+        channel: sourcePayload.channel || transcriptPayload.channel,
+        duration: sourcePayload.duration || transcriptPayload.duration,
+        transcriptMeta: sourcePayload.transcriptMeta || transcriptPayload.meta,
+        content: transcriptPayload.transcript
+      };
+      rawContent = String(sourcePayload.content || "").trim();
+    }
+  }
+
   if (!rawContent) {
     throw new Error(contentType === "article"
       ? "Could not extract readable article text from this page."
@@ -140,7 +158,7 @@ async function summarizeContent(payload = {}, onDelta = null) {
     : preprocessYouTubeTranscript(rawContent).slice(0, contentLimit);
 
   const wasTruncated = rawContent.length > contentLimit;
-  const metadata = buildMetadata(contentType, payload, wasTruncated, rawContent.length, processedContent.length);
+  const metadata = buildMetadata(contentType, sourcePayload, wasTruncated, rawContent.length, processedContent.length);
   const systemPrompt = getPromptForContentType(settings, contentType);
   const chunks = chunkContent(processedContent, {
     contextWindow: normalizeContextWindow(settings.contextWindow)

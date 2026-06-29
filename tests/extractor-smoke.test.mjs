@@ -7,6 +7,7 @@ const extractorSource = extractFunctionSource(popupSource, "extractYouTubeTransc
 const playerResponseExtractorSource = extractFunctionSource(popupSource, "extractTranscriptViaPlayerResponse");
 const loadTranscriptSource = extractFunctionSource(popupSource, "loadTranscriptViaPlayerResponse");
 const articleExtractorSource = extractFunctionSource(popupSource, "extractArticleFromPage");
+const realSetTimeout = setTimeout;
 
 await testVisibleTranscriptPanel();
 await testShowTranscriptButtonOpensPanel();
@@ -19,6 +20,7 @@ await testPlayerResponseExtractorTriesAlternateCaptionFormats();
 await testLoadTranscriptUsesTimedtextInterceptBeforePanelFallback();
 await testLoadTranscriptUsesPanelFallbackAfterCaptionDownloadFailure();
 await testLoadTranscriptReportsLatestFallbackError();
+await testCaptionTracksTryAlternateFormats();
 await testArticleSemanticDomFallback();
 await testArticlePreviewPaywallMessage();
 await testArticleRegistrationWallMessage();
@@ -225,13 +227,69 @@ async function testEmptyPanelFallsBackToCaptionTracks() {
   assert.equal(fixture.button.clicked, true);
 }
 
+async function testCaptionTracksTryAlternateFormats() {
+  const fetchCalls = [];
+  const fixture = createYouTubeFixture({
+    panelVisible: false,
+    panelMode: "empty",
+    panelInnerText: "Transcript\nSearch transcript",
+    playerResponse: {
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [
+            {
+              baseUrl: "https://example.test/captions",
+              languageCode: "en",
+              kind: "asr",
+              name: { simpleText: "English (auto-generated)" }
+            }
+          ]
+        }
+      }
+    },
+    async fetch(url) {
+      fetchCalls.push(String(url));
+      if (String(url).includes("fmt=json3")) {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({ events: [] });
+          }
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return [
+            "WEBVTT",
+            "",
+            "00:00:01.000 --> 00:00:03.000",
+            "VTT fallback line"
+          ].join("\n");
+        }
+      };
+    }
+  });
+  const result = await runExtractor(fixture);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.meta.source, "caption-url-fallback");
+  assert.match(result.transcript, /VTT fallback line/);
+  assert.match(fetchCalls[0], /fmt=json3/);
+  assert.match(fetchCalls[1], /fmt=vtt/);
+}
+
 async function runExtractor(fixture) {
   const context = {
     console,
     document: fixture.document,
     getComputedStyle: fixture.getComputedStyle,
     fetch: fixture.fetch,
-    setTimeout,
+    setTimeout(callback) {
+      return realSetTimeout(callback, 0);
+    },
     clearTimeout
   };
   context.globalThis = context;
